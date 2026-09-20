@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Weight Tracker", layout="centered")
+st.set_page_config(page_title="Weight Tracker", layout="wide")
 
 # --- CONFIGURATION ---
 SHEET_ID = "1uMLem4JckvHOEvSVlSakFcxv9xxa8WkUR2wg9gjm83k"
@@ -67,7 +67,7 @@ col1.metric(
 )
 col2.metric("Lightest", f"{lightest:.1f} kg")
 col3.metric("Heaviest", f"{heaviest:.1f} kg")
-col4.metric("Loss Rate", f"{monthly_rate:.2f} kg/mo")
+col4.metric("Rate (/month)", f"{monthly_rate:.2f} kg")
 
 st.divider()
 

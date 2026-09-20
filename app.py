@@ -413,7 +413,8 @@ with view_tab_notes:
         "Log habits, breakdowns, or changes and track their weight impact over time."
     )
 
-    with st.expander("📝 Add a New Note / Milestone", expanded=True):
+    # 1. ADD NOTE FORM
+    with st.expander("📝 Add a New Note / Milestone", expanded=False):
         with st.form("note_form", clear_on_submit=True):
             tab_n_date = st.date_input(
                 "Date", value=datetime.date.today(), key="tab_note_date"
@@ -434,16 +435,38 @@ with view_tab_notes:
                 else:
                     st.warning("Please type a note first.")
 
+    # 2. INLINE TABLE WITH EDIT & DELETE POPUPS
     if df_notes.empty:
         st.info("No notes recorded yet. Add your first note above.")
     else:
-        impact_rows = []
-        for _, n_row in df_notes.sort_values("Date", ascending=False).iterrows():
-            note_date = n_row["Date"]
+        # Table Header
+        h_date, h_note, h_before, h_after, h_imp, h_edit, h_del = st.columns(
+            [1.4, 3.4, 2.0, 2.0, 1.4, 0.6, 0.6]
+        )
+        h_date.caption("**Date**")
+        h_note.caption("**Note**")
+        h_before.caption("**Weight Before**")
+        h_after.caption("**Weight After**")
+        h_imp.caption("**Net Impact**")
+        h_edit.caption("")
+        h_del.caption("")
 
+        sorted_notes = (
+            df_notes.sort_values("Date", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        for idx, n_row in sorted_notes.iterrows():
+            note_date = n_row["Date"]
+            note_str_date = note_date.strftime("%Y-%m-%d")
+            note_text = n_row["Note"]
+
+            # Weight before note
             weights_before = df[df["Date"] <= note_date]
             wt_before = (
-                weights_before["Weight"].iloc[-1] if not weights_before.empty else None
+                weights_before["Weight"].iloc[-1]
+                if not weights_before.empty
+                else None
             )
             date_before = (
                 weights_before["Date"].iloc[-1].strftime("%d %b %Y")
@@ -451,9 +474,12 @@ with view_tab_notes:
                 else "N/A"
             )
 
+            # Weight after note
             weights_after = df[df["Date"] > note_date]
             wt_after = (
-                weights_after["Weight"].iloc[0] if not weights_after.empty else None
+                weights_after["Weight"].iloc[0]
+                if not weights_after.empty
+                else None
             )
             date_after = (
                 weights_after["Date"].iloc[0].strftime("%d %b %Y")
@@ -465,20 +491,92 @@ with view_tab_notes:
                 net_change = wt_after - wt_before
                 diff_display = f"{net_change:+.2f} kg"
             else:
-                diff_display = "Awaiting subsequent weigh-in"
+                diff_display = "Awaiting weigh-in"
 
-            impact_rows.append(
-                {
-                    "Date": note_date.strftime("%d %b %Y"),
-                    "Note": n_row["Note"],
-                    "Weight Before": (
-                        f"{wt_before:.2f} kg ({date_before})" if wt_before else "N/A"
-                    ),
-                    "Weight After": (
-                        f"{wt_after:.2f} kg ({date_after})" if wt_after else "Pending"
-                    ),
-                    "Net Impact": diff_display,
-                }
+            c_date, c_note, c_before, c_after, c_imp, c_edit, c_del = st.columns(
+                [1.4, 3.4, 2.0, 2.0, 1.4, 0.6, 0.6], vertical_alignment="center"
             )
 
-        st.dataframe(pd.DataFrame(impact_rows), width="stretch", hide_index=True)
+            c_date.write(note_date.strftime("%d %b %Y"))
+            c_note.write(note_text)
+            c_before.write(
+                f"{wt_before:.2f} kg ({date_before})"
+                if wt_before
+                else "N/A"
+            )
+            c_after.write(
+                f"{wt_after:.2f} kg ({date_after})"
+                if wt_after
+                else "Pending"
+            )
+            c_imp.write(diff_display)
+
+            # EDIT POPOVER
+            with c_edit:
+                with st.popover("✏️", help="Edit note"):
+                    st.caption("**Edit Entry**")
+                    new_date_val = st.date_input(
+                        "Change Date",
+                        value=note_date.date(),
+                        key=f"edit_date_{idx}_{note_str_date}",
+                    )
+                    new_text_val = st.text_area(
+                        "Change Note",
+                        value=note_text,
+                        key=f"edit_text_{idx}_{note_str_date}",
+                    )
+                    if st.button("Save Changes", key=f"save_edit_{idx}_{note_str_date}"):
+                        if new_text_val.strip():
+                            _, ws_n = get_worksheets()
+                            all_rows = ws_n.get_all_values()
+                            row_idx_to_edit = None
+
+                            for r_idx, row in enumerate(all_rows[1:], start=2):
+                                if (
+                                    len(row) >= 2
+                                    and row[0].strip() == note_str_date.strip()
+                                    and row[1].strip() == note_text.strip()
+                                ):
+                                    row_idx_to_edit = r_idx
+                                    break
+
+                            if row_idx_to_edit:
+                                ws_n.update(
+                                    range_name=f"A{row_idx_to_edit}:B{row_idx_to_edit}",
+                                    values=[
+                                        [
+                                            new_date_val.strftime("%Y-%m-%d"),
+                                            new_text_val.strip(),
+                                        ]
+                                    ],
+                                )
+                                st.cache_data.clear()
+                                st.success("Updated!")
+                                st.rerun()
+
+            # DELETE POPOVER
+            with c_del:
+                with st.popover("🗑️", help="Delete note"):
+                    st.caption("Permanently delete this note?")
+                    if st.button(
+                        "Yes, Delete",
+                        type="primary",
+                        key=f"confirm_del_{idx}_{note_str_date}",
+                    ):
+                        _, ws_n = get_worksheets()
+                        all_rows = ws_n.get_all_values()
+                        row_idx_to_del = None
+
+                        for r_idx, row in enumerate(all_rows[1:], start=2):
+                            if (
+                                len(row) >= 2
+                                and row[0].strip() == note_str_date.strip()
+                                and row[1].strip() == note_text.strip()
+                            ):
+                                row_idx_to_del = r_idx
+                                break
+
+                        if row_idx_to_del:
+                            ws_n.delete_rows(row_idx_to_del)
+                            st.cache_data.clear()
+                            st.rerun()

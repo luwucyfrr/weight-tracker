@@ -54,10 +54,40 @@ def load_notes_data():
     df_n["Note"] = df_n["Note"].astype(str)
     return df_n.sort_values("Date").reset_index(drop=True)
 
+def get_meals_worksheet():
+    creds = dict(st.secrets["gcp_service_account"])
+    if "\\n" in creds["private_key"]:
+        creds["private_key"] = creds["private_key"].replace("\\n", "\n")
+
+    gc = gspread.service_account_from_dict(creds)
+    sh = gc.open_by_key(SHEET_ID)
+
+    try:
+        return sh.worksheet("Meals")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Meals", rows=100, cols=4)
+        ws.append_row(["Date", "Meal", "Items", "Notes"])
+        return ws
+
+
+@st.cache_data(ttl=60)
+def load_meals_data():
+    ws_meals = get_meals_worksheet()
+    records = ws_meals.get_all_records()
+    if not records:
+        return pd.DataFrame(columns=["Date", "Meal", "Items", "Notes"])
+    df_m = pd.DataFrame(records)
+    df_m["Date"] = pd.to_datetime(df_m["Date"])
+    df_m["Meal"] = df_m["Meal"].astype(str)
+    df_m["Items"] = df_m["Items"].astype(str)
+    df_m["Notes"] = df_m["Notes"].astype(str)
+    return df_m.sort_values("Date", ascending=False).reset_index(drop=True)
+
 
 try:
     df = load_weight_data()
     df_notes = load_notes_data()
+    df_meals = load_meals_data()
 except Exception as e:
     st.error(f"Failed to connect to private Google Sheet: {e}")
     st.stop()
@@ -197,7 +227,9 @@ st.divider()
 # ----------------------------------------------------
 # 3. TOP NAVIGATION TABS (CHART vs NOTES & IMPACT)
 # ----------------------------------------------------
-view_tab_chart, view_tab_notes = st.tabs(["📊 Progress Chart", "📝 Notes & Impact"])
+view_tab_chart, view_tab_notes, view_tab_food = st.tabs(
+    ["📊 Progress Chart", "📝 Notes & Impact", "🍽️ Food Log"]
+)
 
 # ----------------------------------------------------
 # TAB 1: INTERACTIVE PLOTLY CHART
@@ -371,6 +403,54 @@ with view_tab_chart:
                         line=dict(color="#7e22ce", width=1.5),
                     ),
                     hovertemplate="<b>📝 Note (%{x|%d %b %Y})</b><br>%{customdata}<extra></extra>",
+                )
+            )
+
+    # Meals Markers on Chart (Filtered by active date window)
+    if not df_meals.empty:
+        df_meals_visible = df_meals[
+            (df_meals["Date"] >= start_date) & (df_meals["Date"] <= end_date)
+        ].copy()
+
+        if not df_meals_visible.empty and not df_visible.empty:
+            # Group multiple meals on the same date into a single hover card
+            meal_tooltips = {}
+            for d, grp in df_meals_visible.groupby("Date"):
+                lines = []
+                for _, r in grp.iterrows():
+                    entry = f"• <b>{r['Meal']}</b>: {r['Items']}"
+                    if r["Notes"]:
+                        entry += f" <i>({r['Notes']})</i>"
+                    lines.append(entry)
+                meal_tooltips[d] = "<br>".join(lines)
+
+            df_meals_summary = pd.DataFrame(
+                list(meal_tooltips.items()), columns=["Date", "MealSummary"]
+            )
+
+            # Pin meal icons to the closest weigh-in point
+            meals_merged = pd.merge_asof(
+                df_meals_summary.sort_values("Date"),
+                df[["Date", "Weight"]].sort_values("Date"),
+                on="Date",
+                direction="nearest",
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=meals_merged["Date"],
+                    y=meals_merged["Weight"],
+                    mode="markers",
+                    name="Meals 🍽️",
+                    legendgroup="meals",
+                    customdata=meals_merged["MealSummary"],
+                    marker=dict(
+                        symbol="circle",
+                        size=11,
+                        color="#f97316",
+                        line=dict(color="#c2410c", width=1.5),
+                    ),
+                    hovertemplate="<b>🍽️ Logged Meals (%{x|%d %b %Y})</b><br>%{customdata}<extra></extra>",
                 )
             )
 
@@ -580,3 +660,260 @@ with view_tab_notes:
                             ws_n.delete_rows(row_idx_to_del)
                             st.cache_data.clear()
                             st.rerun()
+
+# ----------------------------------------------------
+# TAB 3: DAILY FOOD & WEIGHT TIMELINE
+# ----------------------------------------------------
+with view_tab_food:
+    st.subheader("Daily Food & Weight Timeline")
+    st.caption("A chronological log of morning weigh-ins and meals.")
+
+    # 1. ADD MEAL FORM
+    with st.expander("🍽️ Log a Meal", expanded=False):
+        with st.form("meal_form", clear_on_submit=True):
+            col_m1, col_m2 = st.columns([1, 1])
+            m_date = col_m1.date_input(
+                "Date", value=datetime.date.today(), key="meal_date_input"
+            )
+            m_type = col_m2.selectbox(
+                "Meal",
+                ["Breakfast", "Lunch", "Dinner", "Snack", "Drinks / Dessert"],
+                key="meal_type_input",
+            )
+            m_items = st.text_area(
+                "Food / Items",
+                placeholder="e.g. Schezwan Noodles, Paneer roll, coffee...",
+                key="meal_items_input",
+            )
+            m_notes = st.text_input(
+                "Notes / Restaurant (optional)",
+                placeholder="e.g. Home cooked, A Cup of Joy, ~450 kcal...",
+                key="meal_notes_input",
+            )
+
+            if st.form_submit_button("Save Meal"):
+                if m_items.strip():
+                    ws_m = get_meals_worksheet()
+                    ws_m.append_row(
+                        [
+                            m_date.strftime("%Y-%m-%d"),
+                            m_type,
+                            m_items.strip(),
+                            m_notes.strip(),
+                        ]
+                    )
+                    st.cache_data.clear()
+                    st.success("Meal logged!")
+                    st.rerun()
+                else:
+                    st.warning("Please enter what you ate.")
+
+    # 2. VIEW CONTROLS
+    show_weigh_ins = st.toggle(
+        "Show weigh-in rows in timeline",
+        value=True,
+        key="toggle_show_weigh_ins",
+    )
+
+    # 3. COMBINE OPTIONAL WEIGHTS & MEALS INTO ONE TIMELINE
+    slot_order = {
+        "Morning Weigh-in": 0,
+        "Breakfast": 1,
+        "Lunch": 2,
+        "Snack": 3,
+        "Dinner": 4,
+        "Drinks / Dessert": 5,
+    }
+
+    timeline_entries = []
+
+    # Inject Recorded Weigh-ins only if toggle is enabled
+    if show_weigh_ins and not df.empty:
+        df_sorted_w = df.sort_values("Date").reset_index(drop=True)
+        for i, w_row in df_sorted_w.iterrows():
+            w_val = float(w_row["Weight"])
+
+            if i > 0:
+                prev_val = float(df_sorted_w["Weight"].iloc[i - 1])
+                diff = w_val - prev_val
+                if diff < 0:
+                    delta_str = f":green[▼ {abs(diff):.2f} kg]"
+                elif diff > 0:
+                    delta_str = f":red[▲ +{diff:.2f} kg]"
+                else:
+                    delta_str = ":gray[— 0.00 kg]"
+            else:
+                delta_str = ":gray[Baseline weigh-in]"
+
+            timeline_entries.append(
+                {
+                    "Date": w_row["Date"],
+                    "Slot": "Morning Weigh-in",
+                    "Order": slot_order["Morning Weigh-in"],
+                    "DisplayType": "⚖️ Weigh-in",
+                    "Content": f"**{w_val:.2f} kg**",
+                    "Notes": delta_str,
+                    "IsWeight": True,
+                    "RawRow": None,
+                    "Idx": i,
+                }
+            )
+
+    # Inject Recorded Meals
+    if not df_meals.empty:
+        for j, m_row in df_meals.iterrows():
+            m_type = m_row["Meal"]
+            timeline_entries.append(
+                {
+                    "Date": m_row["Date"],
+                    "Slot": m_type,
+                    "Order": slot_order.get(m_type, 3),
+                    "DisplayType": f"🍽️ {m_type}",
+                    "Content": m_row["Items"],
+                    "Notes": m_row["Notes"] if m_row["Notes"] else "—",
+                    "IsWeight": False,
+                    "RawRow": m_row,
+                    "Idx": j,
+                }
+            )
+
+    if not timeline_entries:
+        st.info("No entries to display. Use the form above to log a meal.")
+    else:
+        # Sort newest date first; within date, morning weigh-in down to evening meals
+        df_timeline = pd.DataFrame(timeline_entries).sort_values(
+            by=["Date", "Order"], ascending=[False, True]
+        )
+
+        # Table Header
+        h_date, h_type, h_items, h_notes, h_edit, h_del = st.columns(
+            [1.3, 1.4, 3.1, 2.2, 0.5, 0.5]
+        )
+        h_date.caption("**Date**")
+        h_type.caption("**Type**")
+        h_items.caption("**Details / Items**")
+        h_notes.caption("**Net Impact / Notes**")
+        h_edit.caption("")
+        h_del.caption("")
+
+        for _, row in df_timeline.iterrows():
+            entry_date = row["Date"]
+            date_str = entry_date.strftime("%d %b %Y")
+            date_iso = entry_date.strftime("%Y-%m-%d")
+
+            c_date, c_type, c_items, c_notes, c_edit, c_del = st.columns(
+                [1.3, 1.4, 3.1, 2.2, 0.5, 0.5], vertical_alignment="center"
+            )
+
+            c_date.write(date_str)
+
+            if row["IsWeight"]:
+                c_type.markdown(f"`{row['DisplayType']}`")
+                c_items.markdown(row["Content"])
+                c_notes.markdown(row["Notes"])
+                c_edit.write("")
+                c_del.write("")
+            else:
+                c_type.write(f"**{row['Slot']}**")
+                c_items.write(row["Content"])
+                c_notes.write(row["Notes"])
+
+                m_data = row["RawRow"]
+                m_idx = row["Idx"]
+
+                with c_edit:
+                    with st.popover("✏️", help="Edit meal"):
+                        st.caption("**Edit Meal**")
+                        edit_d = st.date_input(
+                            "Date",
+                            value=entry_date.date(),
+                            key=f"tl_ed_{m_idx}",
+                        )
+                        meal_opts = [
+                            "Breakfast",
+                            "Lunch",
+                            "Dinner",
+                            "Snack",
+                            "Drinks / Dessert",
+                        ]
+                        curr_opt_idx = (
+                            meal_opts.index(m_data["Meal"])
+                            if m_data["Meal"] in meal_opts
+                            else 0
+                        )
+                        edit_t = st.selectbox(
+                            "Meal",
+                            meal_opts,
+                            index=curr_opt_idx,
+                            key=f"tl_et_{m_idx}",
+                        )
+                        edit_i = st.text_area(
+                            "Items",
+                            value=m_data["Items"],
+                            key=f"tl_ei_{m_idx}",
+                        )
+                        edit_n = st.text_input(
+                            "Notes",
+                            value=m_data["Notes"],
+                            key=f"tl_en_{m_idx}",
+                        )
+
+                        if st.button("Save", key=f"tl_es_{m_idx}"):
+                            if edit_i.strip():
+                                ws_m = get_meals_worksheet()
+                                all_r = ws_m.get_all_values()
+                                target_r = None
+
+                                for r_i, r in enumerate(all_r[1:], start=2):
+                                    if (
+                                        len(r) >= 3
+                                        and r[0].strip() == date_iso.strip()
+                                        and r[1].strip()
+                                        == m_data["Meal"].strip()
+                                        and r[2].strip()
+                                        == m_data["Items"].strip()
+                                    ):
+                                        target_r = r_i
+                                        break
+
+                                if target_r:
+                                    ws_m.update(
+                                        range_name=f"A{target_r}:D{target_r}",
+                                        values=[
+                                            [
+                                                edit_d.strftime("%Y-%m-%d"),
+                                                edit_t,
+                                                edit_i.strip(),
+                                                edit_n.strip(),
+                                            ]
+                                        ],
+                                    )
+                                    st.cache_data.clear()
+                                    st.rerun()
+
+                with c_del:
+                    with st.popover("🗑️", help="Delete meal"):
+                        st.caption("Delete this meal?")
+                        if st.button(
+                            "Yes, Delete",
+                            type="primary",
+                            key=f"tl_del_{m_idx}",
+                        ):
+                            ws_m = get_meals_worksheet()
+                            all_r = ws_m.get_all_values()
+                            target_r = None
+
+                            for r_i, r in enumerate(all_r[1:], start=2):
+                                if (
+                                    len(r) >= 3
+                                    and r[0].strip() == date_iso.strip()
+                                    and r[1].strip() == m_data["Meal"].strip()
+                                    and r[2].strip() == m_data["Items"].strip()
+                                ):
+                                    target_r = r_i
+                                    break
+
+                            if target_r:
+                                ws_m.delete_rows(target_r)
+                                st.cache_data.clear()
+                                st.rerun()

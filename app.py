@@ -21,17 +21,57 @@ def get_worksheets():
     gc = gspread.service_account_from_dict(creds)
     sh = gc.open_by_key(SHEET_ID)
 
-    ws_weights = sh.sheet1
+    ws_w = sh.sheet1
 
-    # Auto-create 'Notes' worksheet if it doesn't already exist
     try:
-        ws_notes = sh.worksheet("Notes")
+        ws_n = sh.worksheet("Notes")
     except gspread.exceptions.WorksheetNotFound:
-        ws_notes = sh.add_worksheet(title="Notes", rows=100, cols=2)
-        ws_notes.append_row(["Date", "Note"])
+        ws_n = sh.add_worksheet(title="Notes", rows=100, cols=4)
+        ws_n.append_row(["Date", "End Date", "Category", "Note"])
+        return ws_w, ws_n
 
-    return ws_weights, ws_notes
+    headers = ws_n.row_values(1)
+    if headers and "End Date" not in headers:
+        all_rows = ws_n.get_all_values()
+        if all_rows:
+            new_rows = [["Date", "End Date", "Category", "Note"]]
+            for r in all_rows[1:]:
+                d = r[0] if len(r) > 0 else ""
+                if len(r) >= 3 and "Category" in headers:
+                    cat = r[1]
+                    note = r[2] if len(r) > 2 else ""
+                    new_rows.append([d, d, cat, note])
+                elif len(r) >= 2:
+                    note = r[1]
+                    new_rows.append([d, d, "Note", note])
+                else:
+                    new_rows.append([d, d, "Note", ""])
+            ws_n.clear()
+            ws_n.update(range_name=f"A1:D{len(new_rows)}", values=new_rows)
 
+    return ws_w, ws_n
+
+
+@st.cache_data(ttl=60)
+def load_notes_data():
+    _, ws_n = get_worksheets()
+    records = ws_n.get_all_records()
+    if not records:
+        return pd.DataFrame(columns=["Date", "End Date", "Category", "Note"])
+    df_n = pd.DataFrame(records)
+    df_n["Date"] = pd.to_datetime(df_n["Date"], errors="coerce")
+    if "End Date" not in df_n.columns:
+        df_n["End Date"] = df_n["Date"]
+    else:
+        df_n["End Date"] = pd.to_datetime(df_n["End Date"], errors="coerce").fillna(df_n["Date"])
+    df_n = df_n.dropna(subset=["Date"]).copy()
+    # Ensure End Date is at least Date
+    df_n["End Date"] = df_n[["Date", "End Date"]].max(axis=1)
+    if "Category" not in df_n.columns:
+        df_n["Category"] = "Note"
+    df_n["Category"] = df_n["Category"].astype(str).str.strip()
+    df_n["Note"] = df_n["Note"].astype(str).str.strip()
+    return df_n
 
 @st.cache_data(ttl=60)
 def load_weight_data():
@@ -41,18 +81,6 @@ def load_weight_data():
     df["Date"] = pd.to_datetime(df["Date"])
     df["Weight"] = pd.to_numeric(df["Weight"])
     return df.sort_values("Date").reset_index(drop=True)
-
-
-@st.cache_data(ttl=60)
-def load_notes_data():
-    _, ws_notes = get_worksheets()
-    records = ws_notes.get_all_records()
-    if not records:
-        return pd.DataFrame(columns=["Date", "Note"])
-    df_n = pd.DataFrame(records)
-    df_n["Date"] = pd.to_datetime(df_n["Date"])
-    df_n["Note"] = df_n["Note"].astype(str)
-    return df_n.sort_values("Date").reset_index(drop=True)
 
 def get_meals_worksheet():
     creds = dict(st.secrets["gcp_service_account"])
@@ -258,7 +286,7 @@ st.divider()
 # 3. TOP NAVIGATION TABS (CHART vs NOTES & IMPACT)
 # ----------------------------------------------------
 view_tab_chart, view_tab_notes, view_tab_food = st.tabs(
-    ["📊 Progress Chart", "📝 Notes & Impact", "🍽️ Food Log"]
+    ["📊 Progress Chart", "📝 Notes", "🍽️ Food Log"]
 )
 
 # ----------------------------------------------------
@@ -408,7 +436,9 @@ with view_tab_chart:
     # Notes Markers on Chart (Filtered by active date window)
     if not df_notes.empty:
         df_notes_visible = df_notes[
-            (df_notes["Date"] >= start_date) & (df_notes["Date"] <= end_date)
+            (~df_notes["Category"].isin(["Japan", "Steps"]))
+            & (df_notes["Date"] >= start_date)
+            & (df_notes["Date"] <= end_date)
         ].copy()
 
         if not df_notes_visible.empty and not df_visible.empty:
@@ -484,12 +514,145 @@ with view_tab_chart:
                 )
             )
 
+    # ----------------------------------------------------
+    # 1. JAPAN TRACKING (Light Pink Vertical Shading across duration)
+    # ----------------------------------------------------
+    if not df_notes.empty:
+        df_japan = (
+            df_notes[df_notes["Category"] == "Japan"]
+            .sort_values("Date")
+            .copy()
+        )
+        if not df_japan.empty:
+            japan_intervals = []
+            for _, j_row in df_japan.iterrows():
+                s = j_row["Date"].date()
+                e = j_row["End Date"].date()
+                if s > e:
+                    s, e = e, s
+                japan_intervals.append((s, e))
+
+            if japan_intervals:
+                japan_intervals.sort(key=lambda x: x[0])
+                merged_ranges = [japan_intervals[0]]
+                for s, e in japan_intervals[1:]:
+                    prev_s, prev_e = merged_ranges[-1]
+                    if s <= prev_e + datetime.timedelta(days=1):
+                        merged_ranges[-1] = (prev_s, max(prev_e, e))
+                    else:
+                        merged_ranges.append((s, e))
+
+                for r_start, r_end in merged_ranges:
+                    # Pad edges by 12 hours so the full day/duration is shaded
+                    x0_val = pd.to_datetime(r_start) - pd.Timedelta(hours=12)
+                    x1_val = pd.to_datetime(r_end) + pd.Timedelta(hours=12)
+                    fig.add_vrect(
+                        x0=x0_val,
+                        x1=x1_val,
+                        fillcolor="rgba(251, 113, 133, 0.18)",  # Soft light pink
+                        layer="below",
+                        line_width=0,
+                    )
+
+    # ----------------------------------------------------
+    # 2. STEP FOOTPRINTS ACROSS DURATION (1 Footprint per 10k Steps)
+    # ----------------------------------------------------
+    if not df_notes.empty and not df_visible.empty:
+        import numpy as np
+
+        df_steps_log = df_notes[
+            (df_notes["Category"] == "Steps")
+            & (df_notes["End Date"] >= start_date)
+            & (df_notes["Date"] <= end_date)
+        ].copy()
+
+        if not df_steps_log.empty:
+            ts_vis = [t.timestamp() for t in df_visible["Date"]]
+            wt_vis = df_visible["Weight"].values
+            first_step_trace = True
+
+            for _, s_row in df_steps_log.iterrows():
+                raw_note = s_row["Note"]
+                digits = "".join(filter(str.isdigit, raw_note))
+                if not digits:
+                    continue
+                num_steps = int(digits)
+                num_footprints = max(1, round(num_steps / 10000))
+
+                s_start = s_row["Date"]
+                s_end = s_row["End Date"]
+                if s_start > s_end:
+                    s_start, s_end = s_end, s_start
+
+                duration_days = (s_end.date() - s_start.date()).days + 1
+
+                # Clean optional note description
+                extra_desc = ""
+                if "(" in raw_note and ")" in raw_note:
+                    extra_desc = raw_note[raw_note.find("(") + 1 : raw_note.rfind(")")]
+
+                hover_card = (
+                    f"<b>👟 Steps Duration:</b> {num_steps:,} steps<br>"
+                    f"<b>Period:</b> {s_start.strftime('%d %b')} — {s_end.strftime('%d %b %Y')} ({duration_days} days)<br>"
+                    f"<b>Steps:</b> {num_footprints} x 10k steps"
+                )
+                if extra_desc:
+                    hover_card += f"<br><i>\"{extra_desc}\"</i>"
+
+                k = min(num_footprints, 8)
+                if duration_days > 1 and s_start != s_end and k > 1:
+                    fp_dates = [
+                        s_start + (s_end - s_start) * (i / (k - 1))
+                        for i in range(k)
+                    ]
+                    fp_texts = ["👣"] * k
+                else:
+                    fp_dates = [s_start + (s_end - s_start) / 2]
+                    fp_texts = ["👣" * min(num_footprints, 5)]
+
+                # Only footprints at the top of the graph space (no brackets, no step count text)
+                fig.add_trace(
+                    go.Scatter(
+                        x=fp_dates,
+                        y=[0.93] * len(fp_dates),
+                        yaxis="y2",
+                        mode="text",
+                        text=fp_texts,
+                        textposition="middle center",
+                        textfont=dict(size=18),
+                        name="Weekly Steps",
+                        legendgroup="steps",
+                        showlegend=first_step_trace,
+                        customdata=[hover_card] * len(fp_dates),
+                        hovertemplate="%{customdata}<extra></extra>",
+                    )
+                )
+                first_step_trace = False
+
+    # Add headroom to reversed y-axis so weight curve stays below the top steps track
+    if not df_visible.empty:
+        min_wt = float(df_visible["Weight"].min())
+        max_wt = float(df_visible["Weight"].max())
+        wt_span = max(max_wt - min_wt, 2.0)
+        pad_top = max(1.8, wt_span * 0.25)
+        pad_bottom = max(1.0, wt_span * 0.12)
+        primary_y_range = [max_wt + pad_bottom, min_wt - pad_top]
+    else:
+        primary_y_range = None
+
     fig.update_layout(
         yaxis=dict(
-            autorange="reversed",
+            autorange="reversed" if primary_y_range is None else False,
+            range=primary_y_range,
             title="Weight (kg)",
             gridcolor="#1e293b",
             zeroline=False,
+        ),
+        yaxis2=dict(
+            overlaying="y",
+            range=[0, 1],
+            visible=False,
+            fixedrange=True,
         ),
         xaxis=dict(
             title="",
@@ -499,7 +662,7 @@ with view_tab_chart:
         ),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=20, r=20, t=10, b=20),
+        margin=dict(l=20, r=20, t=35, b=20),
         hovermode="closest",
         legend=dict(
             orientation="h",
@@ -514,50 +677,214 @@ with view_tab_chart:
 
     st.plotly_chart(fig, width="stretch")
 
-# ----------------------------------------------------
-# TAB 2: NOTES & PROGRESS IMPACT VIEW
-# ----------------------------------------------------
-with view_tab_notes:
-    st.subheader("Action Notes & Weight Impact")
-    st.caption(
-        "Log habits, breakdowns, or changes and track their weight impact over time."
+    # Replace 'Aa' text mode icon in Plotly legend with footprints 👣
+    import streamlit.components.v1 as components
+
+    components.html(
+        """
+        <script>
+        (function() {
+            if (window.frameElement) {
+                window.frameElement.style.display = 'none';
+            }
+            function updateStepLegend() {
+                try {
+                    const p = window.parent.document;
+                    if (!p) return;
+                    const pointTexts = p.querySelectorAll('.legendpoints .pointtext text');
+                    pointTexts.forEach(el => {
+                        if (el.textContent === 'Aa' || el.innerHTML.includes('Aa')) {
+                            el.textContent = '👣';
+                            el.setAttribute('font-size', '15px');
+                            el.style.fontSize = '15px';
+                            el.setAttribute('dy', '0.35em');
+                        }
+                    });
+                } catch (e) {}
+            }
+            updateStepLegend();
+            try {
+                const p = window.parent.document;
+                if (p && p.body && !window._steps_legend_obs) {
+                    window._steps_legend_obs = new MutationObserver(updateStepLegend);
+                    window._steps_legend_obs.observe(p.body, { childList: true, subtree: true });
+                }
+            } catch (e) {}
+            let count = 0;
+            const timer = setInterval(() => {
+                updateStepLegend();
+                count++;
+                if (count > 25) clearInterval(timer);
+            }, 200);
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
     )
 
-    # 1. ADD NOTE FORM
-    with st.expander("📝 Add a New Note / Milestone", expanded=False):
-        with st.form("note_form", clear_on_submit=True):
-            tab_n_date = st.date_input(
-                "Date", value=datetime.date.today(), key="tab_note_date"
-            )
-            tab_n_text = st.text_area(
-                "What did you do or what happened?",
-                placeholder="e.g. Swapped sugary drinks for water, started evening walks, intermittent fasting...",
-            )
-            if st.form_submit_button("Save Note"):
-                if tab_n_text.strip():
+# ----------------------------------------------------
+# TAB 2: NOTES, JAPAN & STEP LOGS
+# ----------------------------------------------------
+with view_tab_notes:
+    st.subheader("Lily's Notes & Milestone Tracker")
+    
+    # 1. ADD ENTRY FORM WITH CATEGORY-SPECIFIC CONTROLS
+    with st.expander("➕ Add a note", expanded=False):
+        col_cat_sel, _ = st.columns([1.2, 1.8])
+        selected_cat = col_cat_sel.selectbox(
+            "Category",
+            ["Japan", "Steps", "Note"],
+            format_func=lambda c: (
+                "🇯🇵 Japan"
+                if c == "Japan"
+                else (
+                    "👟 Weekly Steps"
+                    if c == "Steps"
+                    else "📝 General Note"
+                )
+            ),
+            key="add_cat_select",
+        )
+
+        if selected_cat == "Japan":
+            with st.form("form_add_japan", clear_on_submit=True):
+                col_d1, col_n1 = st.columns([1.2, 1.8])
+                default_j_start = datetime.date.today() - datetime.timedelta(days=4)
+                default_j_end = datetime.date.today()
+                japan_dates = col_d1.date_input(
+                    "Duration (Click Start Date, then End Date)",
+                    value=(default_j_start, default_j_end),
+                    help="Select the start and end dates of the japan duration.",
+                    key="add_j_dates",
+                )
+                japan_note = col_n1.text_input(
+                    "Notes / Symptoms (optional)",
+                    placeholder="e.g. Day 1 cramps, light flow, fatigue...",
+                    key="add_j_note",
+                )
+                if st.form_submit_button("Save Japan Duration", type="primary"):
+                    if isinstance(japan_dates, (tuple, list)) and len(japan_dates) == 2:
+                        j_s, j_e = sorted(japan_dates)
+                    elif isinstance(japan_dates, (tuple, list)) and len(japan_dates) == 1:
+                        j_s = j_e = japan_dates[0]
+                    else:
+                        j_s = j_e = datetime.date.today()
+
+                    j_text = (
+                        japan_note.strip()
+                        if japan_note.strip()
+                        else "Japan logged"
+                    )
                     _, ws_n = get_worksheets()
                     ws_n.append_row(
-                        [tab_n_date.strftime("%Y-%m-%d"), tab_n_text.strip()]
+                        [
+                            j_s.strftime("%Y-%m-%d"),
+                            j_e.strftime("%Y-%m-%d"),
+                            "Japan",
+                            j_text,
+                        ]
                     )
                     st.cache_data.clear()
-                    st.success("Note saved and pinned to chart!")
+                    st.success(
+                        f"Japan duration ({j_s.strftime('%d %b')} – {j_e.strftime('%d %b %Y')}) logged with pink shading!"
+                    )
                     st.rerun()
-                else:
-                    st.warning("Please type a note first.")
+
+        elif selected_cat == "Steps":
+            with st.form("form_add_steps", clear_on_submit=True):
+                col_d2, col_s2 = st.columns([1.2, 1.0])
+                default_s_start = datetime.date.today() - datetime.timedelta(days=6)
+                default_s_end = datetime.date.today()
+                steps_dates = col_d2.date_input(
+                    "Duration (Click Start Date, then End Date)",
+                    value=(default_s_start, default_s_end),
+                    help="Select the week or date range for these steps.",
+                    key="add_s_dates",
+                )
+                steps_val = col_s2.number_input(
+                    "Total Steps in Duration",
+                    min_value=1000,
+                    max_value=300000,
+                    value=50000,
+                    step=1000,
+                    help="1 footprint 👣 will be added on the chart for every 10,000 steps.",
+                    key="add_s_val",
+                )
+                extra_step_note = st.text_input(
+                    "Notes / Activities (optional)",
+                    placeholder="e.g. 7k daily average, long Sunday trail hike...",
+                    key="add_s_note",
+                )
+                if st.form_submit_button("Save Steps Duration", type="primary"):
+                    if isinstance(steps_dates, (tuple, list)) and len(steps_dates) == 2:
+                        s_s, s_e = sorted(steps_dates)
+                    elif isinstance(steps_dates, (tuple, list)) and len(steps_dates) == 1:
+                        s_s = s_e = steps_dates[0]
+                    else:
+                        s_s = s_e = datetime.date.today()
+
+                    step_text = f"{steps_val:,} steps"
+                    if extra_step_note.strip():
+                        step_text += f" ({extra_step_note.strip()})"
+                    _, ws_n = get_worksheets()
+                    ws_n.append_row(
+                        [
+                            s_s.strftime("%Y-%m-%d"),
+                            s_e.strftime("%Y-%m-%d"),
+                            "Steps",
+                            step_text,
+                        ]
+                    )
+                    st.cache_data.clear()
+                    st.success(
+                        f"Steps duration ({steps_val:,} steps from {s_s.strftime('%d %b')} – {s_e.strftime('%d %b %Y')}) logged with footprints!"
+                    )
+                    st.rerun()
+
+        else:
+            with st.form("form_add_note", clear_on_submit=True):
+                col_d3, _ = st.columns([1.2, 1.8])
+                note_date = col_d3.date_input(
+                    "Date", value=datetime.date.today(), key="add_n_date"
+                )
+                standard_note = st.text_area(
+                    "Note",
+                    placeholder="e.g. Swapped sugary drinks for water, started morning walks...",
+                    key="add_n_text",
+                )
+                if st.form_submit_button("Save Note", type="primary"):
+                    if standard_note.strip():
+                        _, ws_n = get_worksheets()
+                        d_str = note_date.strftime("%Y-%m-%d")
+                        ws_n.append_row(
+                            [
+                                d_str,
+                                d_str,
+                                "Note",
+                                standard_note.strip(),
+                            ]
+                        )
+                        st.cache_data.clear()
+                        st.success("Note saved!")
+                        st.rerun()
+                    else:
+                        st.warning("Please type a note before saving.")
 
     # 2. INLINE TABLE WITH EDIT & DELETE POPUPS
     if df_notes.empty:
-        st.info("No notes recorded yet. Add your first note above.")
+        st.info("No entries recorded yet. Add your first log above.")
     else:
         # Table Header
-        h_date, h_note, h_before, h_after, h_imp, h_edit, h_del = st.columns(
-            [1.4, 3.4, 2.0, 2.0, 1.4, 0.6, 0.6]
+        h_date, h_cat, h_note, h_before, h_after, h_imp, h_edit, h_del = (
+            st.columns([1.6, 1.1, 2.5, 1.6, 1.6, 1.1, 0.5, 0.5])
         )
-        h_date.caption("**Date**")
-        h_note.caption("**Note**")
+        h_date.caption("**Date / Duration**")
+        h_cat.caption("**Category**")
+        h_note.caption("**Details**")
         h_before.caption("**Weight Before**")
         h_after.caption("**Weight After**")
-        h_imp.caption("**Net Impact**")
+        h_imp.caption("**Impact**")
         h_edit.caption("")
         h_del.caption("")
 
@@ -567,127 +894,208 @@ with view_tab_notes:
         )
 
         for idx, n_row in sorted_notes.iterrows():
-            note_date = n_row["Date"]
-            note_str_date = note_date.strftime("%Y-%m-%d")
-            note_text = n_row["Note"]
+            n_start = n_row["Date"]
+            n_end = n_row["End Date"]
+            n_start_str = n_start.strftime("%Y-%m-%d")
+            n_end_str = n_end.strftime("%Y-%m-%d")
+            n_cat = n_row["Category"]
+            n_text = n_row["Note"]
 
-            # Weight before note
-            weights_before = df[df["Date"] <= note_date]
+            # Weight calculations based on duration
+            weights_before = df[df["Date"] <= n_start]
             wt_before = (
                 weights_before["Weight"].iloc[-1]
                 if not weights_before.empty
                 else None
             )
             date_before = (
-                weights_before["Date"].iloc[-1].strftime("%d %b %Y")
+                weights_before["Date"].iloc[-1].strftime("%d %b")
                 if not weights_before.empty
-                else "N/A"
+                else ""
             )
 
-            # Weight after note
-            weights_after = df[df["Date"] > note_date]
+            if n_start.date() == n_end.date():
+                weights_after = df[df["Date"] > n_start]
+            else:
+                weights_after = df[df["Date"] >= n_end]
+
             wt_after = (
                 weights_after["Weight"].iloc[0]
                 if not weights_after.empty
                 else None
             )
             date_after = (
-                weights_after["Date"].iloc[0].strftime("%d %b %Y")
+                weights_after["Date"].iloc[0].strftime("%d %b")
                 if not weights_after.empty
-                else "Pending"
+                else ""
             )
 
             if wt_before is not None and wt_after is not None:
                 net_change = wt_after - wt_before
                 diff_display = f"{net_change:+.2f} kg"
             else:
-                diff_display = "Awaiting weigh-in"
+                diff_display = "—"
 
-            c_date, c_note, c_before, c_after, c_imp, c_edit, c_del = st.columns(
-                [1.4, 3.4, 2.0, 2.0, 1.4, 0.6, 0.6], vertical_alignment="center"
+            c_date, c_cat, c_note, c_before, c_after, c_imp, c_edit, c_del = (
+                st.columns(
+                    [1.6, 1.1, 2.5, 1.6, 1.6, 1.1, 0.5, 0.5],
+                    vertical_alignment="center",
+                )
             )
 
-            c_date.write(note_date.strftime("%d %b %Y"))
-            c_note.write(note_text)
+            # Format Date / Duration display
+            if n_start.date() == n_end.date():
+                c_date.write(n_start.strftime("%d %b %Y"))
+            elif n_start.year == n_end.year:
+                c_date.write(
+                    f"{n_start.strftime('%d %b')} – {n_end.strftime('%d %b %Y')}"
+                )
+            else:
+                c_date.write(
+                    f"{n_start.strftime('%d %b %Y')} – {n_end.strftime('%d %b %Y')}"
+                )
+
+            # Category badge styling
+            if n_cat == "Japan":
+                c_cat.markdown(":red-background[🇯🇵 Japan]")
+            elif n_cat == "Steps":
+                c_cat.markdown(":blue-background[👟 Steps]")
+            else:
+                c_cat.markdown("📝 Note")
+
+            c_note.write(n_text)
             c_before.write(
-                f"{wt_before:.2f} kg ({date_before})"
-                if wt_before
-                else "N/A"
+                f"{wt_before:.2f} kg ({date_before})" if wt_before else "—"
             )
             c_after.write(
-                f"{wt_after:.2f} kg ({date_after})"
-                if wt_after
-                else "Pending"
+                f"{wt_after:.2f} kg ({date_after})" if wt_after else "—"
             )
             c_imp.write(diff_display)
 
             # EDIT POPOVER
             with c_edit:
-                with st.popover("✏️", help="Edit note"):
+                with st.popover("✏️", help="Edit entry"):
                     st.caption("**Edit Entry**")
-                    new_date_val = st.date_input(
-                        "Change Date",
-                        value=note_date.date(),
-                        key=f"edit_date_{idx}_{note_str_date}",
-                    )
-                    new_text_val = st.text_area(
-                        "Change Note",
-                        value=note_text,
-                        key=f"edit_text_{idx}_{note_str_date}",
-                    )
-                    if st.button("Save Changes", key=f"save_edit_{idx}_{note_str_date}"):
-                        if new_text_val.strip():
-                            _, ws_n = get_worksheets()
-                            all_rows = ws_n.get_all_values()
-                            row_idx_to_edit = None
+                    if n_cat in ["Japan", "Steps"]:
+                        ed_dates = st.date_input(
+                            "Duration (Start — End)",
+                            value=(n_start.date(), n_end.date()),
+                            key=f"ed_nd_{idx}",
+                        )
+                    else:
+                        ed_dates = st.date_input(
+                            "Date",
+                            value=n_start.date(),
+                            key=f"ed_nd_{idx}",
+                        )
 
-                            for r_idx, row in enumerate(all_rows[1:], start=2):
-                                if (
-                                    len(row) >= 2
-                                    and row[0].strip() == note_str_date.strip()
-                                    and row[1].strip() == note_text.strip()
-                                ):
-                                    row_idx_to_edit = r_idx
+                    cat_options = ["Japan", "Steps", "Note"]
+                    cat_idx = (
+                        cat_options.index(n_cat)
+                        if n_cat in cat_options
+                        else 0
+                    )
+                    new_cat = st.selectbox(
+                        "Category",
+                        cat_options,
+                        index=cat_idx,
+                        key=f"ed_nc_{idx}",
+                    )
+                    new_text = st.text_area(
+                        "Details / Note", value=n_text, key=f"ed_nt_{idx}"
+                    )
+
+                    if st.button("Save Changes", key=f"save_ed_n_{idx}"):
+                        if new_text.strip():
+                            if (
+                                isinstance(ed_dates, (tuple, list))
+                                and len(ed_dates) == 2
+                            ):
+                                ed_s, ed_e = sorted(ed_dates)
+                            elif (
+                                isinstance(ed_dates, (tuple, list))
+                                and len(ed_dates) == 1
+                            ):
+                                ed_s = ed_e = ed_dates[0]
+                            else:
+                                ed_s = ed_e = ed_dates
+
+                            _, ws_n = get_worksheets()
+                            all_r = ws_n.get_all_values()
+                            target_r = None
+
+                            for r_i, r in enumerate(all_r[1:], start=2):
+                                if len(r) >= 4:
+                                    match = (
+                                        r[0].strip() == n_start_str
+                                        and r[1].strip() == n_end_str
+                                        and r[2].strip() == n_cat.strip()
+                                        and r[3].strip() == n_text.strip()
+                                    )
+                                elif len(r) >= 3:
+                                    match = (
+                                        r[0].strip() == n_start_str
+                                        and r[1].strip() == n_cat.strip()
+                                        and r[2].strip() == n_text.strip()
+                                    )
+                                else:
+                                    match = False
+
+                                if match:
+                                    target_r = r_i
                                     break
 
-                            if row_idx_to_edit:
+                            if target_r:
                                 ws_n.update(
-                                    range_name=f"A{row_idx_to_edit}:B{row_idx_to_edit}",
+                                    range_name=f"A{target_r}:D{target_r}",
                                     values=[
                                         [
-                                            new_date_val.strftime("%Y-%m-%d"),
-                                            new_text_val.strip(),
+                                            ed_s.strftime("%Y-%m-%d"),
+                                            ed_e.strftime("%Y-%m-%d"),
+                                            new_cat,
+                                            new_text.strip(),
                                         ]
                                     ],
                                 )
                                 st.cache_data.clear()
-                                st.success("Updated!")
                                 st.rerun()
 
             # DELETE POPOVER
             with c_del:
-                with st.popover("🗑️", help="Delete note"):
-                    st.caption("Permanently delete this note?")
+                with st.popover("🗑️", help="Delete entry"):
+                    st.caption(f"Delete this {n_cat.lower()} entry?")
                     if st.button(
                         "Yes, Delete",
                         type="primary",
-                        key=f"confirm_del_{idx}_{note_str_date}",
+                        key=f"del_n_{idx}",
                     ):
                         _, ws_n = get_worksheets()
-                        all_rows = ws_n.get_all_values()
-                        row_idx_to_del = None
+                        all_r = ws_n.get_all_values()
+                        target_r = None
 
-                        for r_idx, row in enumerate(all_rows[1:], start=2):
-                            if (
-                                len(row) >= 2
-                                and row[0].strip() == note_str_date.strip()
-                                and row[1].strip() == note_text.strip()
-                            ):
-                                row_idx_to_del = r_idx
+                        for r_i, r in enumerate(all_r[1:], start=2):
+                            if len(r) >= 4:
+                                match = (
+                                    r[0].strip() == n_start_str
+                                    and r[1].strip() == n_end_str
+                                    and r[2].strip() == n_cat.strip()
+                                    and r[3].strip() == n_text.strip()
+                                )
+                            elif len(r) >= 3:
+                                match = (
+                                    r[0].strip() == n_start_str
+                                    and r[1].strip() == n_cat.strip()
+                                    and r[2].strip() == n_text.strip()
+                                )
+                            else:
+                                match = False
+
+                            if match:
+                                target_r = r_i
                                 break
 
-                        if row_idx_to_del:
-                            ws_n.delete_rows(row_idx_to_del)
+                        if target_r:
+                            ws_n.delete_rows(target_r)
                             st.cache_data.clear()
                             st.rerun()
 

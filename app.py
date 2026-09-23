@@ -63,11 +63,39 @@ def get_meals_worksheet():
     sh = gc.open_by_key(SHEET_ID)
 
     try:
-        return sh.worksheet("Meals")
+        ws = sh.worksheet("Meals")
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Meals", rows=100, cols=4)
-        ws.append_row(["Date", "Meal", "Items", "Notes"])
+        ws = sh.add_worksheet(title="Meals", rows=100, cols=5)
+        ws.append_row(["Date", "Time", "Meal", "Items", "Notes"])
         return ws
+
+    # Automatic migration: if existing sheet has 4 columns without 'Time', insert it
+    headers = ws.row_values(1)
+    if headers and "Time" not in headers:
+        all_rows = ws.get_all_values()
+        if all_rows:
+            new_rows = [["Date", "Time", "Meal", "Items", "Notes"]]
+            fallback_times = {
+                "Breakfast": "09:00",
+                "Lunch": "13:30",
+                "Snack": "17:00",
+                "Dinner": "20:30",
+                "Drinks / Dessert": "21:30",
+            }
+            for r in all_rows[1:]:
+                d = r[0] if len(r) > 0 else ""
+                m = r[1] if len(r) > 1 else ""
+                items = r[2] if len(r) > 2 else ""
+                notes = r[3] if len(r) > 3 else ""
+                t = fallback_times.get(m, "12:00")
+                new_rows.append([d, t, m, items, notes])
+            ws.clear()
+            ws.update(
+                range_name=f"A1:E{len(new_rows)}",
+                values=new_rows,
+            )
+
+    return ws
 
 
 @st.cache_data(ttl=60)
@@ -75,14 +103,16 @@ def load_meals_data():
     ws_meals = get_meals_worksheet()
     records = ws_meals.get_all_records()
     if not records:
-        return pd.DataFrame(columns=["Date", "Meal", "Items", "Notes"])
+        return pd.DataFrame(columns=["Date", "Time", "Meal", "Items", "Notes"])
     df_m = pd.DataFrame(records)
     df_m["Date"] = pd.to_datetime(df_m["Date"])
+    if "Time" not in df_m.columns:
+        df_m["Time"] = "12:00"
+    df_m["Time"] = df_m["Time"].astype(str).str.strip()
     df_m["Meal"] = df_m["Meal"].astype(str)
     df_m["Items"] = df_m["Items"].astype(str)
     df_m["Notes"] = df_m["Notes"].astype(str)
-    return df_m.sort_values("Date", ascending=False).reset_index(drop=True)
-
+    return df_m
 
 try:
     df = load_weight_data()
@@ -662,7 +692,7 @@ with view_tab_notes:
                             st.rerun()
 
 # ----------------------------------------------------
-# TAB 3: DAILY FOOD & WEIGHT TIMELINE
+# TAB 3: DAILY FOOD & WEIGHT TIMELINE (EXACT TIME SORT)
 # ----------------------------------------------------
 with view_tab_food:
     st.subheader("Daily Food & Weight Timeline")
@@ -671,11 +701,16 @@ with view_tab_food:
     # 1. ADD MEAL FORM
     with st.expander("🍽️ Log a Meal", expanded=False):
         with st.form("meal_form", clear_on_submit=True):
-            col_m1, col_m2 = st.columns([1, 1])
+            col_m1, col_m2, col_m3 = st.columns([1.2, 1.0, 1.2])
             m_date = col_m1.date_input(
                 "Date", value=datetime.date.today(), key="meal_date_input"
             )
-            m_type = col_m2.selectbox(
+            m_time = col_m2.time_input(
+                "Time",
+                value=datetime.datetime.now().time(),
+                key="meal_time_input",
+            )
+            m_type = col_m3.selectbox(
                 "Meal",
                 ["Breakfast", "Lunch", "Dinner", "Snack", "Drinks / Dessert"],
                 key="meal_type_input",
@@ -697,6 +732,7 @@ with view_tab_food:
                     ws_m.append_row(
                         [
                             m_date.strftime("%Y-%m-%d"),
+                            m_time.strftime("%H:%M"),
                             m_type,
                             m_items.strip(),
                             m_notes.strip(),
@@ -715,62 +751,74 @@ with view_tab_food:
         key="toggle_show_weigh_ins",
     )
 
-    # 3. COMBINE OPTIONAL WEIGHTS & MEALS INTO ONE TIMELINE
-    slot_order = {
-        "Morning Weigh-in": 0,
-        "Breakfast": 1,
-        "Lunch": 2,
-        "Snack": 3,
-        "Dinner": 4,
-        "Drinks / Dessert": 5,
-    }
-
+    # 3. MERGE WEIGHTS AND MEALS WITH EXACT TIMESTAMPS
     timeline_entries = []
 
-    # Inject Recorded Weigh-ins only if toggle is enabled
+    # Weigh-ins: Morning check-in time (07:30 AM) with distinct styling data
     if show_weigh_ins and not df.empty:
         df_sorted_w = df.sort_values("Date").reset_index(drop=True)
         for i, w_row in df_sorted_w.iterrows():
             w_val = float(w_row["Weight"])
+            w_date = w_row["Date"]
+            w_datetime = datetime.datetime.combine(
+                w_date.date(), datetime.time(7, 30)
+            )
 
             if i > 0:
                 prev_val = float(df_sorted_w["Weight"].iloc[i - 1])
                 diff = w_val - prev_val
                 if diff < 0:
-                    delta_str = f":green[▼ {abs(diff):.2f} kg]"
+                    notes_clean = f"▼ {abs(diff):.2f} kg"
+                    delta_color = "#4ade80"  # Vibrant green
                 elif diff > 0:
-                    delta_str = f":red[▲ +{diff:.2f} kg]"
+                    notes_clean = f"▲ +{diff:.2f} kg"
+                    delta_color = "#f87171"  # Vibrant red
                 else:
-                    delta_str = ":gray[— 0.00 kg]"
+                    notes_clean = "— 0.00 kg"
+                    delta_color = "#94a3b8"  # Slate gray
             else:
-                delta_str = ":gray[Baseline weigh-in]"
+                notes_clean = "Baseline weigh-in"
+                delta_color = "#94a3b8"
 
             timeline_entries.append(
                 {
-                    "Date": w_row["Date"],
-                    "Slot": "Morning Weigh-in",
-                    "Order": slot_order["Morning Weigh-in"],
+                    "DateTime": w_datetime,
+                    "DateStr": w_date.strftime("%d %b %Y"),
+                    "TimeStr": "07:30 AM",
                     "DisplayType": "⚖️ Weigh-in",
-                    "Content": f"**{w_val:.2f} kg**",
-                    "Notes": delta_str,
+                    "Content": f"{w_val:.2f} kg",
+                    "Notes": notes_clean,
+                    "DeltaColor": delta_color,
                     "IsWeight": True,
                     "RawRow": None,
                     "Idx": i,
                 }
             )
 
-    # Inject Recorded Meals
+    # Meals: Use logged time
     if not df_meals.empty:
         for j, m_row in df_meals.iterrows():
-            m_type = m_row["Meal"]
+            m_date = m_row["Date"]
+            t_str = m_row["Time"] if m_row["Time"] else "12:00"
+
+            try:
+                t_parts = [int(p) for p in t_str.split(":")[:2]]
+                t_obj = datetime.time(t_parts[0], t_parts[1])
+            except Exception:
+                t_obj = datetime.time(12, 0)
+
+            m_datetime = datetime.datetime.combine(m_date.date(), t_obj)
+            formatted_time = t_obj.strftime("%I:%M %p")
+
             timeline_entries.append(
                 {
-                    "Date": m_row["Date"],
-                    "Slot": m_type,
-                    "Order": slot_order.get(m_type, 3),
-                    "DisplayType": f"🍽️ {m_type}",
+                    "DateTime": m_datetime,
+                    "DateStr": m_date.strftime("%d %b %Y"),
+                    "TimeStr": formatted_time,
+                    "DisplayType": f"🍽️ {m_row['Meal']}",
                     "Content": m_row["Items"],
                     "Notes": m_row["Notes"] if m_row["Notes"] else "—",
+                    "DeltaColor": "#94a3b8",
                     "IsWeight": False,
                     "RawRow": m_row,
                     "Idx": j,
@@ -780,41 +828,88 @@ with view_tab_food:
     if not timeline_entries:
         st.info("No entries to display. Use the form above to log a meal.")
     else:
-        # Sort newest date first; within date, morning weigh-in down to evening meals
+        # Strictly reverse-chronological by exact timestamp
         df_timeline = pd.DataFrame(timeline_entries).sort_values(
-            by=["Date", "Order"], ascending=[False, True]
+            by="DateTime", ascending=False
         )
 
         # Table Header
-        h_date, h_type, h_items, h_notes, h_edit, h_del = st.columns(
-            [1.3, 1.4, 3.1, 2.2, 0.5, 0.5]
+        h_date, h_time, h_type, h_items, h_notes, h_edit, h_del = st.columns(
+            [1.2, 0.9, 1.2, 3.0, 2.1, 0.5, 0.5]
         )
         h_date.caption("**Date**")
+        h_time.caption("**Time**")
         h_type.caption("**Type**")
         h_items.caption("**Details / Items**")
         h_notes.caption("**Net Impact / Notes**")
         h_edit.caption("")
         h_del.caption("")
 
+        last_date = None
+
         for _, row in df_timeline.iterrows():
-            entry_date = row["Date"]
-            date_str = entry_date.strftime("%d %b %Y")
-            date_iso = entry_date.strftime("%Y-%m-%d")
+            entry_dt = row["DateTime"]
+            entry_date_obj = entry_dt.date()
+            date_iso = entry_dt.strftime("%Y-%m-%d")
 
-            c_date, c_type, c_items, c_notes, c_edit, c_del = st.columns(
-                [1.3, 1.4, 3.1, 2.2, 0.5, 0.5], vertical_alignment="center"
-            )
+            # 1. VISUAL SEPARATOR BETWEEN DIFFERENT DATES
+            if last_date is not None and entry_date_obj != last_date:
+                st.divider()
 
-            c_date.write(date_str)
+            last_date = entry_date_obj
 
+            # 2. ACCENTED WEIGH-IN CARD (DISTINCT BACKGROUND)
             if row["IsWeight"]:
-                c_type.markdown(f"`{row['DisplayType']}`")
-                c_items.markdown(row["Content"])
-                c_notes.markdown(row["Notes"])
-                c_edit.write("")
-                c_del.write("")
+                st.markdown(
+                    f"""
+                    <div style="
+                        display: grid;
+                        grid-template-columns: 1.2fr 0.9fr 1.2fr 3.0fr 2.1fr 1.0fr;
+                        align-items: center;
+                        background: linear-gradient(90deg, rgba(30, 58, 138, 0.38) 0%, rgba(15, 23, 42, 0.55) 100%);
+                        border: 1px solid rgba(59, 130, 246, 0.35);
+                        border-left: 4px solid #38bdf8;
+                        border-radius: 8px;
+                        padding: 8px 12px;
+                        margin: 4px 0 6px 0;
+                        font-size: 0.95rem;
+                    ">
+                        <div style="color: #f1f5f9; font-weight: 500;">{row['DateStr']}</div>
+                        <div style="color: #94a3b8; font-size: 0.88rem;">{row['TimeStr']}</div>
+                        <div>
+                            <span style="
+                                background: rgba(56, 189, 248, 0.15);
+                                color: #38bdf8;
+                                border: 1px solid rgba(56, 189, 248, 0.4);
+                                padding: 2px 8px;
+                                border-radius: 6px;
+                                font-size: 0.82rem;
+                                font-weight: 600;
+                            ">⚖️ Weigh-in</span>
+                        </div>
+                        <div style="color: #ffffff; font-weight: 700; font-size: 1.05rem;">
+                            {row['Content']}
+                        </div>
+                        <div style="color: {row['DeltaColor']}; font-weight: 600; font-size: 0.92rem;">
+                            {row['Notes']}
+                        </div>
+                        <div></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
             else:
-                c_type.write(f"**{row['Slot']}**")
+                # 3. REGULAR MEAL ROW (WITH INLINE EDIT & DELETE)
+                c_date, c_time, c_type, c_items, c_notes, c_edit, c_del = (
+                    st.columns(
+                        [1.2, 0.9, 1.2, 3.0, 2.1, 0.5, 0.5],
+                        vertical_alignment="center",
+                    )
+                )
+
+                c_date.write(row["DateStr"])
+                c_time.write(row["TimeStr"])
+                c_type.write(f"**{row['RawRow']['Meal']}**")
                 c_items.write(row["Content"])
                 c_notes.write(row["Notes"])
 
@@ -826,8 +921,13 @@ with view_tab_food:
                         st.caption("**Edit Meal**")
                         edit_d = st.date_input(
                             "Date",
-                            value=entry_date.date(),
+                            value=entry_dt.date(),
                             key=f"tl_ed_{m_idx}",
+                        )
+                        edit_tm = st.time_input(
+                            "Time",
+                            value=entry_dt.time(),
+                            key=f"tl_etm_{m_idx}",
                         )
                         meal_opts = [
                             "Breakfast",
@@ -866,11 +966,11 @@ with view_tab_food:
 
                                 for r_i, r in enumerate(all_r[1:], start=2):
                                     if (
-                                        len(r) >= 3
+                                        len(r) >= 4
                                         and r[0].strip() == date_iso.strip()
-                                        and r[1].strip()
-                                        == m_data["Meal"].strip()
                                         and r[2].strip()
+                                        == m_data["Meal"].strip()
+                                        and r[3].strip()
                                         == m_data["Items"].strip()
                                     ):
                                         target_r = r_i
@@ -878,10 +978,11 @@ with view_tab_food:
 
                                 if target_r:
                                     ws_m.update(
-                                        range_name=f"A{target_r}:D{target_r}",
+                                        range_name=f"A{target_r}:E{target_r}",
                                         values=[
                                             [
                                                 edit_d.strftime("%Y-%m-%d"),
+                                                edit_tm.strftime("%H:%M"),
                                                 edit_t,
                                                 edit_i.strip(),
                                                 edit_n.strip(),
@@ -905,10 +1006,10 @@ with view_tab_food:
 
                             for r_i, r in enumerate(all_r[1:], start=2):
                                 if (
-                                    len(r) >= 3
+                                    len(r) >= 4
                                     and r[0].strip() == date_iso.strip()
-                                    and r[1].strip() == m_data["Meal"].strip()
-                                    and r[2].strip() == m_data["Items"].strip()
+                                    and r[2].strip() == m_data["Meal"].strip()
+                                    and r[3].strip() == m_data["Items"].strip()
                                 ):
                                     target_r = r_i
                                     break

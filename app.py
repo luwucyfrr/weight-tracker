@@ -3,6 +3,7 @@ import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Weight Tracker", layout="wide")
 
@@ -93,33 +94,39 @@ def get_meals_worksheet():
     try:
         ws = sh.worksheet("Meals")
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Meals", rows=100, cols=5)
-        ws.append_row(["Date", "Time", "Meal", "Items", "Notes"])
+        ws = sh.add_worksheet(title="Meals", rows=100, cols=6)
+        ws.append_row(["Date", "Time", "Meal", "Source", "Items", "Notes"])
         return ws
 
-    # Automatic migration: if existing sheet has 4 columns without 'Time', insert it
+    # Automatic migration: if existing sheet has 5 columns without 'Source', insert it
     headers = ws.row_values(1)
-    if headers and "Time" not in headers:
+    if headers and "Source" not in headers:
         all_rows = ws.get_all_values()
         if all_rows:
-            new_rows = [["Date", "Time", "Meal", "Items", "Notes"]]
-            fallback_times = {
-                "Breakfast": "09:00",
-                "Lunch": "13:30",
-                "Snack": "17:00",
-                "Dinner": "20:30",
-                "Drinks / Dessert": "21:30",
-            }
+            new_rows = [["Date", "Time", "Meal", "Source", "Items", "Notes"]]
             for r in all_rows[1:]:
                 d = r[0] if len(r) > 0 else ""
-                m = r[1] if len(r) > 1 else ""
-                items = r[2] if len(r) > 2 else ""
-                notes = r[3] if len(r) > 3 else ""
-                t = fallback_times.get(m, "12:00")
-                new_rows.append([d, t, m, items, notes])
+                t = r[1] if len(r) > 1 else "12:00"
+                m = r[2] if len(r) > 2 else ""
+                items = r[3] if len(r) > 3 else ""
+                old_note = r[4] if len(r) > 4 else ""
+                if old_note.strip().lower() in ["im a bakri", "omw to become a dhokla"]:
+                    source = "Home Cooked"
+                    note = old_note.strip()
+                elif old_note.strip():
+                    source = old_note.strip()
+                    note = ""
+                else:
+                    source = "Home Cooked"
+                    note = ""
+                new_rows.append([d, t, m, source, items, note])
+
+            if ws.col_count < 6:
+                ws.resize(cols=6)
+
             ws.clear()
             ws.update(
-                range_name=f"A1:E{len(new_rows)}",
+                range_name=f"A1:F{len(new_rows)}",
                 values=new_rows,
             )
 
@@ -131,14 +138,21 @@ def load_meals_data():
     ws_meals = get_meals_worksheet()
     records = ws_meals.get_all_records()
     if not records:
-        return pd.DataFrame(columns=["Date", "Time", "Meal", "Items", "Notes"])
+        return pd.DataFrame(
+            columns=["Date", "Time", "Meal", "Source", "Items", "Notes"]
+        )
     df_m = pd.DataFrame(records)
     df_m["Date"] = pd.to_datetime(df_m["Date"])
     if "Time" not in df_m.columns:
         df_m["Time"] = "12:00"
     df_m["Time"] = df_m["Time"].astype(str).str.strip()
     df_m["Meal"] = df_m["Meal"].astype(str)
+    if "Source" not in df_m.columns:
+        df_m["Source"] = "Home Cooked"
+    df_m["Source"] = df_m["Source"].astype(str).str.strip()
     df_m["Items"] = df_m["Items"].astype(str)
+    if "Notes" not in df_m.columns:
+        df_m["Notes"] = ""
     df_m["Notes"] = df_m["Notes"].astype(str)
     return df_m
 
@@ -295,10 +309,10 @@ view_tab_chart, view_tab_notes, view_tab_food = st.tabs(
 with view_tab_chart:
     # 1. Compute Full History Metrics (Preserves accurate EWMA & all-time stars)
     df["Trend"] = (
-        df.set_index("Date")["Weight"]
+        df["Weight"]
         .ewm(
-            halflife=pd.Timedelta(days=28),
-            times=df.set_index("Date").index,
+            halflife=pd.Timedelta(days=28),  # type: ignore[arg-type]
+            times=df["Date"],
             adjust=True,
         )
         .mean()
@@ -478,9 +492,17 @@ with view_tab_chart:
             for d, grp in df_meals_visible.groupby("Date"):
                 lines = []
                 for _, r in grp.iterrows():
-                    entry = f"• <b>{r['Meal']}</b>: {r['Items']}"
-                    if r["Notes"]:
-                        entry += f" <i>({r['Notes']})</i>"
+                    src_tag = (
+                        f" <i>[{r['Source']}]</i>"
+                        if ("Source" in r and r["Source"] and r["Source"] != "—")
+                        else ""
+                    )
+                    note_tag = (
+                        f" <i>({r['Notes']})</i>"
+                        if ("Notes" in r and r["Notes"] and r["Notes"] != "—")
+                        else ""
+                    )
+                    entry = f"• <b>{r['Meal']}</b>{src_tag}: {r['Items']}{note_tag}"
                     lines.append(entry)
                 meal_tooltips[d] = "<br>".join(lines)
 
@@ -678,8 +700,6 @@ with view_tab_chart:
     st.plotly_chart(fig, width="stretch")
 
     # Replace 'Aa' text mode icon in Plotly legend with footprints 👣
-    import streamlit.components.v1 as components
-
     components.html(
         """
         <script>
@@ -1007,18 +1027,17 @@ with view_tab_notes:
 
                     if st.button("Save Changes", key=f"save_ed_n_{idx}"):
                         if new_text.strip():
-                            if (
-                                isinstance(ed_dates, (tuple, list))
-                                and len(ed_dates) == 2
-                            ):
-                                ed_s, ed_e = sorted(ed_dates)
-                            elif (
-                                isinstance(ed_dates, (tuple, list))
-                                and len(ed_dates) == 1
-                            ):
-                                ed_s = ed_e = ed_dates[0]
-                            else:
+                            if isinstance(ed_dates, (tuple, list)):
+                                if len(ed_dates) >= 2:
+                                    ed_s, ed_e = sorted(ed_dates[:2])
+                                elif len(ed_dates) == 1:
+                                    ed_s = ed_e = ed_dates[0]
+                                else:
+                                    ed_s = ed_e = n_start.date()
+                            elif isinstance(ed_dates, datetime.date):
                                 ed_s = ed_e = ed_dates
+                            else:
+                                ed_s = ed_e = n_start.date()
 
                             _, ws_n = get_worksheets()
                             all_r = ws_n.get_all_values()
@@ -1106,6 +1125,22 @@ with view_tab_food:
     st.subheader("Daily Food & Weight Timeline")
     st.caption("A chronological log of morning weigh-ins and meals.")
 
+    # Collect unique past sources for memory dropdown (most frequent first)
+    existing_sources = []
+    if not df_meals.empty and "Source" in df_meals.columns:
+        seen = set()
+        val_counts = df_meals["Source"].astype(str).str.strip().value_counts()
+        for s_val in val_counts.index:
+            s_clean = s_val.strip()
+            if s_clean and s_clean not in ["—", "-", "None", "nan"]:
+                s_key = s_clean.lower()
+                if s_key not in seen:
+                    seen.add(s_key)
+                    existing_sources.append(s_clean)
+
+    if not any(s.lower() == "home cooked" for s in existing_sources):
+        existing_sources.insert(0, "Home Cooked")
+
     # 1. ADD MEAL FORM
     with st.expander("🍽️ Log a Meal", expanded=False):
         with st.form("meal_form", clear_on_submit=True):
@@ -1124,33 +1159,46 @@ with view_tab_food:
                 key="meal_type_input",
             )
             m_items = st.text_area(
-                "Food / Items",
+                "Food / Items *",
                 placeholder="e.g. Schezwan Noodles, Paneer roll, coffee...",
                 key="meal_items_input",
             )
-            m_notes = st.text_input(
-                "Notes / Restaurant (optional)",
-                placeholder="e.g. Home cooked, A Cup of Joy, ~450 kcal...",
+
+            col_s, col_n = st.columns([1.3, 1.7])
+            m_source = col_s.selectbox(
+                "Source * (Mandatory)",
+                options=existing_sources,
+                accept_new_options=True,
+                help="Select from previous sources or type to search / add a new one (e.g. Home Cooked, Wow Momo).",
+                key="meal_source_input",
+            )
+            m_notes = col_n.text_input(
+                "Notes (optional)",
+                placeholder="e.g. high protein, light portion, ~450 kcal...",
                 key="meal_notes_input",
             )
 
-            if st.form_submit_button("Save Meal"):
-                if m_items.strip():
+            if st.form_submit_button("Save Meal", type="primary"):
+                src_val = str(m_source).strip() if m_source else ""
+                if not src_val:
+                    st.warning("Please specify the Source (mandatory, e.g. Home Cooked).")
+                elif not m_items.strip():
+                    st.warning("Please enter what you ate.")
+                else:
                     ws_m = get_meals_worksheet()
                     ws_m.append_row(
                         [
                             m_date.strftime("%Y-%m-%d"),
                             m_time.strftime("%H:%M"),
                             m_type,
+                            src_val,
                             m_items.strip(),
                             m_notes.strip(),
                         ]
                     )
                     st.cache_data.clear()
-                    st.success("Meal logged!")
+                    st.success(f"Meal logged from {src_val}!")
                     st.rerun()
-                else:
-                    st.warning("Please enter what you ate.")
 
     # 2. VIEW CONTROLS
     show_weigh_ins = st.toggle(
@@ -1165,7 +1213,7 @@ with view_tab_food:
     # Weigh-ins: Morning check-in time (07:30 AM) with distinct styling data
     if show_weigh_ins and not df.empty:
         df_sorted_w = df.sort_values("Date").reset_index(drop=True)
-        for i, w_row in df_sorted_w.iterrows():
+        for i, (_, w_row) in enumerate(df_sorted_w.iterrows()):
             w_val = float(w_row["Weight"])
             w_date = w_row["Date"]
             w_datetime = datetime.datetime.combine(
@@ -1194,6 +1242,7 @@ with view_tab_food:
                     "DateStr": w_date.strftime("%d %b %Y"),
                     "TimeStr": "07:30 AM",
                     "DisplayType": "⚖️ Weigh-in",
+                    "Source": "—",
                     "Content": f"{w_val:.2f} kg",
                     "Notes": notes_clean,
                     "DeltaColor": delta_color,
@@ -1218,14 +1267,26 @@ with view_tab_food:
             m_datetime = datetime.datetime.combine(m_date.date(), t_obj)
             formatted_time = t_obj.strftime("%I:%M %p")
 
+            m_src = (
+                str(m_row["Source"]).strip()
+                if ("Source" in m_row and pd.notna(m_row["Source"]))
+                else "—"
+            )
+            m_notes_str = (
+                str(m_row["Notes"]).strip()
+                if ("Notes" in m_row and pd.notna(m_row["Notes"]))
+                else "—"
+            )
+
             timeline_entries.append(
                 {
                     "DateTime": m_datetime,
                     "DateStr": m_date.strftime("%d %b %Y"),
                     "TimeStr": formatted_time,
                     "DisplayType": f"🍽️ {m_row['Meal']}",
+                    "Source": m_src if m_src else "—",
                     "Content": m_row["Items"],
-                    "Notes": m_row["Notes"] if m_row["Notes"] else "—",
+                    "Notes": m_notes_str if m_notes_str else "—",
                     "DeltaColor": "#94a3b8",
                     "IsWeight": False,
                     "RawRow": m_row,
@@ -1242,14 +1303,15 @@ with view_tab_food:
         )
 
         # Table Header
-        h_date, h_time, h_type, h_items, h_notes, h_edit, h_del = st.columns(
-            [1.2, 0.9, 1.2, 3.0, 2.1, 0.5, 0.5]
+        h_date, h_time, h_type, h_src, h_items, h_notes, h_edit, h_del = st.columns(
+            [1.1, 0.9, 1.0, 1.4, 2.7, 1.7, 0.4, 0.4]
         )
         h_date.caption("**Date**")
         h_time.caption("**Time**")
         h_type.caption("**Type**")
+        h_src.caption("**Source**")
         h_items.caption("**Details / Items**")
-        h_notes.caption("**Net Impact / Notes**")
+        h_notes.caption("**Notes**")
         h_edit.caption("")
         h_del.caption("")
 
@@ -1272,7 +1334,7 @@ with view_tab_food:
                     f"""
                     <div style="
                         display: grid;
-                        grid-template-columns: 1.2fr 0.9fr 1.2fr 3.0fr 2.1fr 1.0fr;
+                        grid-template-columns: 1.1fr 0.9fr 1.0fr 1.4fr 2.7fr 1.7fr 0.8fr;
                         align-items: center;
                         background: linear-gradient(90deg, rgba(30, 58, 138, 0.38) 0%, rgba(15, 23, 42, 0.55) 100%);
                         border: 1px solid rgba(59, 130, 246, 0.35);
@@ -1295,6 +1357,7 @@ with view_tab_food:
                                 font-weight: 600;
                             ">⚖️ Weigh-in</span>
                         </div>
+                        <div style="color: #64748b; font-size: 0.85rem;">—</div>
                         <div style="color: #ffffff; font-weight: 700; font-size: 1.05rem;">
                             {row['Content']}
                         </div>
@@ -1308,9 +1371,9 @@ with view_tab_food:
                 )
             else:
                 # 3. REGULAR MEAL ROW (WITH INLINE EDIT & DELETE)
-                c_date, c_time, c_type, c_items, c_notes, c_edit, c_del = (
+                c_date, c_time, c_type, c_src, c_items, c_notes, c_edit, c_del = (
                     st.columns(
-                        [1.2, 0.9, 1.2, 3.0, 2.1, 0.5, 0.5],
+                        [1.1, 0.9, 1.0, 1.4, 2.7, 1.7, 0.4, 0.4],
                         vertical_alignment="center",
                     )
                 )
@@ -1318,6 +1381,15 @@ with view_tab_food:
                 c_date.write(row["DateStr"])
                 c_time.write(row["TimeStr"])
                 c_type.write(f"**{row['RawRow']['Meal']}**")
+
+                src_val = str(row["Source"]).strip()
+                if "home" in src_val.lower():
+                    c_src.markdown(f":green-background[🏠 {src_val}]")
+                elif src_val and src_val != "—":
+                    c_src.markdown(f":orange-background[🏪 {src_val}]")
+                else:
+                    c_src.write("—")
+
                 c_items.write(row["Content"])
                 c_notes.write(row["Notes"])
 
@@ -1355,6 +1427,28 @@ with view_tab_food:
                             index=curr_opt_idx,
                             key=f"tl_et_{m_idx}",
                         )
+
+                        curr_src = (
+                            str(m_data["Source"]).strip()
+                            if ("Source" in m_data and pd.notna(m_data["Source"]))
+                            else ""
+                        )
+                        edit_src_opts = list(existing_sources)
+                        if curr_src and curr_src not in edit_src_opts:
+                            edit_src_opts.insert(0, curr_src)
+                        curr_src_idx = (
+                            edit_src_opts.index(curr_src)
+                            if curr_src in edit_src_opts
+                            else 0
+                        )
+                        edit_src = st.selectbox(
+                            "Source *",
+                            options=edit_src_opts,
+                            index=curr_src_idx,
+                            accept_new_options=True,
+                            key=f"tl_esrc_{m_idx}",
+                        )
+
                         edit_i = st.text_area(
                             "Items",
                             value=m_data["Items"],
@@ -1362,36 +1456,58 @@ with view_tab_food:
                         )
                         edit_n = st.text_input(
                             "Notes",
-                            value=m_data["Notes"],
+                            value=(
+                                str(m_data["Notes"])
+                                if ("Notes" in m_data and pd.notna(m_data["Notes"]))
+                                else ""
+                            ),
                             key=f"tl_en_{m_idx}",
                         )
 
                         if st.button("Save", key=f"tl_es_{m_idx}"):
-                            if edit_i.strip():
+                            src_clean = str(edit_src).strip() if edit_src else ""
+                            if not src_clean:
+                                st.warning("Source cannot be empty.")
+                            elif not edit_i.strip():
+                                st.warning("Items cannot be empty.")
+                            else:
                                 ws_m = get_meals_worksheet()
                                 all_r = ws_m.get_all_values()
                                 target_r = None
 
                                 for r_i, r in enumerate(all_r[1:], start=2):
-                                    if (
-                                        len(r) >= 4
-                                        and r[0].strip() == date_iso.strip()
-                                        and r[2].strip()
-                                        == m_data["Meal"].strip()
-                                        and r[3].strip()
-                                        == m_data["Items"].strip()
-                                    ):
+                                    if len(r) >= 5:
+                                        match = (
+                                            r[0].strip() == date_iso.strip()
+                                            and r[2].strip()
+                                            == m_data["Meal"].strip()
+                                            and r[4].strip()
+                                            == m_data["Items"].strip()
+                                        )
+                                    elif len(r) >= 4:
+                                        match = (
+                                            r[0].strip() == date_iso.strip()
+                                            and r[2].strip()
+                                            == m_data["Meal"].strip()
+                                            and r[3].strip()
+                                            == m_data["Items"].strip()
+                                        )
+                                    else:
+                                        match = False
+
+                                    if match:
                                         target_r = r_i
                                         break
 
                                 if target_r:
                                     ws_m.update(
-                                        range_name=f"A{target_r}:E{target_r}",
+                                        range_name=f"A{target_r}:F{target_r}",
                                         values=[
                                             [
                                                 edit_d.strftime("%Y-%m-%d"),
                                                 edit_tm.strftime("%H:%M"),
                                                 edit_t,
+                                                src_clean,
                                                 edit_i.strip(),
                                                 edit_n.strip(),
                                             ]
@@ -1413,12 +1529,26 @@ with view_tab_food:
                             target_r = None
 
                             for r_i, r in enumerate(all_r[1:], start=2):
-                                if (
-                                    len(r) >= 4
-                                    and r[0].strip() == date_iso.strip()
-                                    and r[2].strip() == m_data["Meal"].strip()
-                                    and r[3].strip() == m_data["Items"].strip()
-                                ):
+                                if len(r) >= 5:
+                                    match = (
+                                        r[0].strip() == date_iso.strip()
+                                        and r[2].strip()
+                                        == m_data["Meal"].strip()
+                                        and r[4].strip()
+                                        == m_data["Items"].strip()
+                                    )
+                                elif len(r) >= 4:
+                                    match = (
+                                        r[0].strip() == date_iso.strip()
+                                        and r[2].strip()
+                                        == m_data["Meal"].strip()
+                                        and r[3].strip()
+                                        == m_data["Items"].strip()
+                                    )
+                                else:
+                                    match = False
+
+                                if match:
                                     target_r = r_i
                                     break
 
